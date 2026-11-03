@@ -1,9 +1,3 @@
-name = "food-health-tg-bot"
+name = "ai-nutrition-health-bot"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
-
-[build]
-command = ""
-
-[site]
-bucket = "src"
