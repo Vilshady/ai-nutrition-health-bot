@@ -13,7 +13,6 @@ export default {
       const fromUser = msg.from || {};
       const firstName = fromUser.first_name || "Друг";
 
-      // Настройка пользователей (Fitbit синхронизируется только для основного ID)
       const primaryUserId = Number(env.PRIMARY_USER_ID || 0);
       const isPrimary = chatId === primaryUserId;
       const user = {
@@ -25,7 +24,6 @@ export default {
       const text = msg.text || msg.caption || "";
       const lower = text.trim().toLowerCase();
 
-      // Команда /start
       if (lower === "/start") {
         await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, 
           `👋 <b>Привет, ${user.name}!</b>\nЯ твой персональный AI-нутрициолог.\n\n• Присылай фото еды или пиши текстом\n• Твой отдельный лист в таблице: <b>${user.sheet}</b>\n• Напиши <i>«удали»</i> для отмены\n• <i>/stats</i> — сводка за день.`
@@ -33,21 +31,18 @@ export default {
         return new Response("OK");
       }
 
-      // Определение биологической даты (сутки сменяются в 05:00 утра)
       const now = new Date(new Date().getTime() + 3 * 3600 * 1000); // UTC+3
       if (now.getUTCHours() < 5) {
         now.setUTCDate(now.getUTCDate() - 1);
       }
       const bioDate = now.toISOString().split("T")[0];
 
-      // Команда «удали»
       if (["удали", "отмени", "стереть", "/undo"].includes(lower)) {
         await fetch(`${env.SHEETS_URL}?action=delete_last&sheet=${encodeURIComponent(user.sheet)}`);
         await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, `🗑 Последняя запись удалена с листа «${user.sheet}».`);
         return new Response("OK");
       }
 
-      // Команда «статистика»
       if (lower.startsWith("/stats") || lower.includes("что я ел") || lower.includes("статистик")) {
         const rowsRes = await fetch(`${env.SHEETS_URL}?sheet=${encodeURIComponent(user.sheet)}`);
         const rows = await rowsRes.json();
@@ -78,7 +73,6 @@ export default {
         return new Response("OK");
       }
 
-      // Обработка фото
       let imageBase64 = null;
       if (msg.photo && msg.photo.length > 0) {
         const fileId = msg.photo[msg.photo.length - 1].file_id;
@@ -88,7 +82,6 @@ export default {
         imageBase64 = arrayBufferToBase64(imgBuffer);
       }
 
-      // Анализ через Gemini API
       const parsed = await analyzeWithGemini(env.GEMINI_API_KEY, user.name, text, imageBase64);
 
       if (parsed.type === "greeting") {
@@ -107,7 +100,6 @@ export default {
         return new Response("OK");
       }
 
-      // Определение слота (Завтрак / Обед / Ужин)
       const rowsRes = await fetch(`${env.SHEETS_URL}?sheet=${encodeURIComponent(user.sheet)}`);
       const rows = await rowsRes.json();
       let slotsToday = [];
@@ -154,37 +146,19 @@ export default {
         })
       });
 
-      // Запись в Fitbit (если включен)
+      // Запись в Fitbit с авто-обновлением токена
       let fitbitStatus = "";
-      if (user.fitbit && env.FITBIT_MCP_URL && env.FITBIT_TOKEN) {
-        try {
-          await fetch(env.FITBIT_MCP_URL, {
-            method: "POST",
-            headers: {
-              "Authorization": `Bearer ${env.FITBIT_TOKEN}`,
-              "Content-Type": "application/json",
-              "User-Agent": "Mozilla/5.0"
-            },
-            body: JSON.stringify({
-              jsonrpc: "2.0",
-              id: Date.now(),
-              method: "tools/call",
-              params: {
-                name: "log_food",
-                arguments: {
-                  name: parsed.name,
-                  meal_type: slotEnum,
-                  calories_kcal: parsed.calories,
-                  protein_g: parsed.protein || 0,
-                  fat_g: parsed.fat || 0,
-                  carbs_g: parsed.carbs || 0,
-                  datetime: new Date().toISOString()
-                }
-              }
-            })
-          });
-          fitbitStatus = " | Fitbit ✓";
-        } catch (e) {}
+      if (user.fitbit && env.FITBIT_MCP_URL) {
+        const fitbitSuccess = await logToFitbitWithRetry(env, {
+          name: parsed.name,
+          meal_type: slotEnum,
+          calories_kcal: parsed.calories,
+          protein_g: parsed.protein || 0,
+          fat_g: parsed.fat || 0,
+          carbs_g: parsed.carbs || 0,
+          datetime: new Date().toISOString()
+        });
+        if (fitbitSuccess) fitbitStatus = " | Fitbit ✓";
       }
 
       const commentBlock = parsed.comment ? `\n💬 <i>${parsed.comment}</i>\n` : "";
@@ -199,6 +173,68 @@ export default {
     return new Response("OK");
   }
 };
+
+async function logToFitbitWithRetry(env, mealData) {
+  let token = env.FITBIT_TOKEN;
+  
+  async function callMcp(t) {
+    const res = await fetch(env.FITBIT_MCP_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${t}`,
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0"
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: Date.now(),
+        method: "tools/call",
+        params: { name: "log_food", arguments: mealData }
+      })
+    });
+    return res.json();
+  }
+
+  try {
+    let res = await callMcp(token);
+    if (res && res.error && res.error.includes("token") && env.FITBIT_REFRESH_TOKEN) {
+      // Обновляем токен
+      const refreshedToken = await refreshOAuthToken(env);
+      if (refreshedToken) {
+        res = await callMcp(refreshedToken);
+      }
+    }
+    return !res.error && !res.isError;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function refreshOAuthToken(env) {
+  try {
+    const creds = btoa(`${env.FITBIT_CLIENT_ID}:${env.FITBIT_CLIENT_SECRET}`);
+    const tokenUrl = "https://fitbit-health-connector.vilshady.workers.dev/token";
+    const body = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: env.FITBIT_REFRESH_TOKEN
+    });
+
+    const res = await fetch(tokenUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Basic ${creds}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0"
+      },
+      body: body.toString()
+    });
+
+    const data = await res.json();
+    return data.access_token;
+  } catch (e) {
+    return null;
+  }
+}
 
 async function sendTelegram(token, chatId, text) {
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
